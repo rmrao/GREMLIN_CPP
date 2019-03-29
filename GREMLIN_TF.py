@@ -9,6 +9,7 @@
 
 # IMPORTANT, only tested using PYTHON 3!
 from typing import Dict, Tuple, Optional
+import contextlib
 import os
 import h5py
 import gzip
@@ -35,13 +36,28 @@ a2n: Dict[str, int] = {a: n for n, a in enumerate(alphabet)}
 # ===============================================================================
 
 
+class SequenceLengthException(Exception):
+
+    def __init__(self, protein_id: str):
+        super().__init__("Sequence length was too long for protein {}".format(protein_id))
+
+
+class TooFewValidMatchesException(Exception):
+
+    def __init__(self, protein_id: str = None):
+        message = 'There were too few valid matches'
+        if protein_id is not None:
+            message += ' for protein {}'.format(protein_id)
+        super().__init__(message)
+
+
 def to_header_and_sequence(block):
     header, *seq = block.split('\n')
     seq = ''.join(seq)
     return header, seq
 
 
-def parse_fasta(filename: str, limit: int = -1) -> Tuple[np.ndarray, np.ndarray]:
+def parse_fasta(filename: str, limit: int = -1, max_seq_len: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
     """
     Function to parse a fasta/a2m file.
 
@@ -64,14 +80,18 @@ def parse_fasta(filename: str, limit: int = -1) -> Tuple[np.ndarray, np.ndarray]
     def get_file_obj():
         return gzip.open(filename) if is_compressed else open(filename)
 
-    # header: List[str] = []
-    # sequence: List[List[str]] = []
     delete_lowercase_trans = ''.maketrans('', '', string.ascii_lowercase)  # type: ignore
     with get_file_obj() as f:
         fasta = f.read()
         if isinstance(fasta, bytes):
             fasta = fasta.decode()
         fasta = fasta.strip('>').translate(delete_lowercase_trans).split('>')
+
+        if max_seq_len is not None:
+            seqlen = len(to_header_and_sequence(fasta[0])[1])
+            if seqlen > max_seq_len:
+                raise SequenceLengthException(filename)
+
         if 0 < limit < len(fasta):
             headers_and_seqs = [to_header_and_sequence(block) for block in fasta[:limit]]
             if is_a2m:
@@ -83,26 +103,6 @@ def parse_fasta(filename: str, limit: int = -1) -> Tuple[np.ndarray, np.ndarray]
                 headers_and_seqs = headers_and_seqs[-1:] + headers_and_seqs[:-1]
 
         header, sequence = zip(*headers_and_seqs)
-
-        # for line in lines:
-            # if isinstance(line, bytes):
-                # line = line.decode()
-            # line = line.rstrip()
-            # if line[0] == ">":
-                # header.append(line[1:])
-                # sequence.append([])
-            # else:
-                # line = line.translate(delete_lowercase_trans)
-                # sequence[-1].append(line)
-    # joined_sequence: List[str] = [''.join(seq) for seq in sequence]
-#
-    # if is_a2m:
-        # header = header[-1:] + header[:-1]
-        # joined_sequence = joined_sequence[-1:] + joined_sequence[:-1]
-#
-    # if limit > 0:
-        # header = header[:limit]
-        # joined_sequence = joined_sequence[:limit]
 
     return np.array(header), np.array(sequence)
 
@@ -135,7 +135,7 @@ def mk_msa(seqs: np.ndarray, gap_cutoff: float = 0.5):
     msa, v_idx = filt_gaps(msa_ori, gap_cutoff)
 
     if len(v_idx) == 0:
-        return None
+        raise TooFewValidMatchesException()
 
     # compute effective weight for each sequence
     msa_weights = get_eff(msa, 0.8)
@@ -358,21 +358,20 @@ def get_mtx(mrf):
     return mtx
 
 
-def run_gremlin(input_file: str, output_file: Optional[h5py.File] = None):
+def run_gremlin(input_file: str, output_file: Optional[h5py.File] = None, max_seq_len: int = 700):
     # ===============================================================================
     # PREP MSA
     # ===============================================================================
-    names, seqs = parse_fasta(input_file, limit=1000)
+    names, seqs = parse_fasta(input_file, limit=1000, max_seq_len=700)
 
-    if len(seqs[0]) > 700:
-        return
-
-    msa = mk_msa(seqs)
-    if msa is None:
-        names, seqs = parse_fasta(input_file)
+    try:
         msa = mk_msa(seqs)
-        if msa is None:
-            raise ValueError(f"Could not generate mrf for {input_file}")
+    except TooFewValidMatchesException:
+        try:
+            names, seqs = parse_fasta(input_file)
+            msa = mk_msa(seqs)
+        except TooFewValidMatchesException:
+            raise TooFewValidMatchesException(input_file)
 
     mrf = GREMLIN(msa)
     mtx = get_mtx(mrf)
@@ -381,12 +380,23 @@ def run_gremlin(input_file: str, output_file: Optional[h5py.File] = None):
 
     if output_file is not None:
         protein_group = output_file.create_group(this_protein_id)
-        protein_group.create_dataset('v', dtype='f', data=np.asarray(mrf['v'], np.float32), compression='gzip')
-        protein_group.create_dataset('w', dtype='f', data=np.asarray(mrf['w'], np.float32), compression='gzip')
-        protein_group.create_dataset('raw', dtype='f', data=np.asarray(mtx['raw'], np.float32), compression='gzip')
-        protein_group.create_dataset('apc', dtype='f', data=np.asarray(mtx['apc'], np.float32), compression='gzip')
-        protein_group.create_dataset('v_idx', dtype='i', data=np.asarray(mrf['v_idx'], np.int32), compression='gzip')
-        protein_group.create_dataset('w_idx', dtype='i', data=np.asarray(mrf['w_idx'], np.int32), compression='gzip')
+        for key in ['v', 'w', 'raw', 'apc', 'v_idx', 'w_idx']:
+            if key in mrf:
+                array = mrf[key]
+            elif key in mtx:
+                array = mtx[key]
+            dtype = array.dtype
+            if dtype in [np.float32, np.float64]:
+                array = np.asarray(array, np.float32)
+                dtype_str = 'f'
+            elif dtype in [np.int32, np.int64]:
+                array = np.asarray(array, np.int32)
+                dtype_str = 'i'
+            else:
+                raise ValueError("Unknown dtype {}".format(dtype))
+
+            protein_group.create_dataset(
+                key, dtype=dtype_str, data=array, compression='gzip')
     else:
         return msa, mrf, mtx
 
@@ -404,7 +414,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    files = glob('/home/rmrao/talisker/raw/**a2m.gz')
+    files = glob('/big/davidchan/roshan/raw/**a2m.gz')
     with tqdm(total=len(files)) as progress_bar:
         for shard in range(len(files) // 1000):
             output_file = args.output_file.split('.')[0]
@@ -421,5 +431,7 @@ if __name__ == '__main__':
                         progress_bar.update()
                         continue
 
-                    run_gremlin(input_file, outfile)
+                    with contextlib.suppress(SequenceLengthException):
+                        run_gremlin(input_file, outfile)
+
                     progress_bar.update()
